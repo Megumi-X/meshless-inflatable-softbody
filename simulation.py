@@ -4,27 +4,21 @@ import open3d as o3d
 from tqdm import tqdm
 import time
 from export_video import export_gif, export_mp4
+from utils import SvdDifferential, W, nabla_W
+from options import real, integer, dim, h, damping, p, project_folder
 
-real = ti.f64
-integer = ti.i32
 ti.init(default_fp=real, default_ip=integer, arch=ti.gpu)
 
 #############################################################################################
 # Initial setup
 #############################################################################################
-dim = 3
-h = 0.0261
-damping = 1e-4
-p = 1e5
-
 # Load point cloud
-project_folder = "./"
 # point_cloud = o3d.io.read_point_cloud(project_folder + "/.ply")
 # points_np = np.asarray(point_cloud.points)
 points = []
 for i in range(40):
     for j in range(20):
-        for k in range(3):
+        for k in range(10):
             points.append([i, j, k])
 points_np = np.array(points) * 0.05
 n_points = points_np.shape[0]
@@ -63,7 +57,13 @@ pressure_energy = ti.field(dtype=real, shape=(), needs_grad=True)
 # Auxiliary fields
 A_pq = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
 R_i = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
+U_i = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
+S_i = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
+V_i = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
 nabla_u = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
+A_pq_grad = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points, dim))
+R_grad = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points, dim))
+nabla_u_grad = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points, dim))
 sigma = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
 
 # Forces
@@ -73,7 +73,11 @@ damping_forces = ti.Vector.field(dim, dtype=real, shape=(n_points,))
 pressure_forces = ti.Vector.field(dim, dtype=real, shape=(n_points,))
 
 # Optimization variables
-x = ratio = ti.field(dtype=real, shape=(n_points,), needs_grad=True)
+x = ti.field(dtype=real, shape=(n_points,), needs_grad=True)
+inside = np.where((points_np[:, 2] - 0.2) * (points_np[:, 2] - 0.8) < 0)[0]
+x_np = -10 * np.ones(n_points)
+x_np[inside] = 10
+x.from_numpy(x_np)
 ratio = ti.field(dtype=real, shape=(n_points,))
 @ti.kernel
 def compute_ratio():
@@ -85,35 +89,7 @@ compute_ratio()
 #############################################################################################
 # Computation functions
 #############################################################################################
-# SPH kernel and its gradient
-@ti.func
-def W(xij: ti.math.vec3, h: real) -> real:
-    q = xij.norm() / h
-    ret = 0.
-    if q < 1:
-        ret = 1 / (np.pi * h ** 3) * (1 - 1.5 * q ** 2 + 0.75 * q ** 3)
-    elif q >= 1 and q < 2:
-        ret = 1 / (4 * np.pi * h ** 3) * (2 - q) ** 3
-    return ret
-
-@ti.func
-def nabla_W(xij: ti.math.vec3, h: real) -> ti.math.vec3:
-    q = xij.norm() / h
-    ret = ti.Vector.zero(real, dim)
-    if q < 1:
-        ret = 1 / (np.pi * h ** 3) * (-3 * xij / h ** 2 + 0.75 * 3 * q * xij / h ** 2)
-    elif q >= 1 and q < 2:
-        ret = 1 / (4 * np.pi * h ** 3) * -3 * (2 - q) ** 2 * xij / q / h / h
-    return ret
-
 # Compute deformation gradient  
-@ti.func
-def compute_com() -> ti.math.vec3:
-    com = ti.Vector.zero(real, dim)
-    for i in range(n_points):
-        com += position[i]
-    return com / n_points
-
 @ti.func
 def compute_v_i(h: real):
     for i in range(n_points):
@@ -136,6 +112,9 @@ def compute_R_i():
     for i in range(n_points):
         W, S, V = ti.svd(A_pq[i])
         R_i[i] = W @ V.transpose()
+        U_i[i] = W
+        S_i[i] = S
+        V_i[i] = V
 
 @ti.func
 def compute_nabla_u(h: real):
@@ -146,6 +125,32 @@ def compute_nabla_u(h: real):
         nabla_u[i] += volume_i[j] * u_ji_bar.outer_product(nabla_W(init_position[i] - init_position[j], h))
     for i in range(n_points):
         def_grad[i] = ti.Matrix.identity(real, dim) + nabla_u[i].transpose()
+
+# Compute gradient of deformation gradient
+@ti.func
+def compute_A_pg_grad(h: real):
+    for i, d in ti.ndrange(n_points, dim):
+        A_pq_grad[i, d] = ti.Matrix.zero(real, dim, dim)
+    for i, j, d in ti.ndrange(n_points, n_points, dim):
+        if ratio[i] < 1e-3: continue
+        A_pq_grad[i, d] += -W(init_position[i] - init_position[j], h) * mass[j] * ti.Vector.unit(dim, d, real).outer_product(init_position[j] - init_position[i])
+
+@ti.func
+def compute_R_grad():
+    for i, d in ti.ndrange(n_points, dim):
+        if ratio[i] < 1e-3: continue
+        dU, dS, dV = SvdDifferential(A_pq[i], U_i[i], S_i[i], V_i[i], A_pq_grad[i, d])
+        R_grad[i, d] = dU @ V_i[i].transpose() + U_i[i] @ dV.transpose()
+
+@ti.func
+def compute_nabla_u_grad(h: real):
+    for i, d in ti.ndrange(n_points, dim):
+        nabla_u_grad[i, d] = ti.Matrix.zero(real, dim, dim)
+    for i, j, d in ti.ndrange(n_points, n_points, dim):
+        if ratio[i] < 1e-3: continue
+        R_inverse = R_i[i].inverse()
+        d_R_x = -R_inverse @ R_grad[i, d] @ R_inverse @ (position[j] - position[i]) - R_inverse @ ti.Vector.unit(dim, d, real)
+        nabla_u_grad[i, d] += volume_i[j] * d_R_x.outer_product(nabla_W(init_position[i] - init_position[j], h))
 
 # Compute elastic forces
 @ti.func
@@ -162,7 +167,7 @@ def compute_elastic_forces(h: real):
     for i, j in ti.ndrange(n_points, n_points):
         f_ji = -volume_i[i] * (ti.Matrix.identity(real, dim) + nabla_u[i].transpose()) @ sigma[i] @ (volume_i[j] * nabla_W(init_position[i] - init_position[j], h))
         f_ij = -volume_i[j] * (ti.Matrix.identity(real, dim) + nabla_u[j].transpose()) @ sigma[j] @ (volume_i[i] * nabla_W(init_position[j] - init_position[i], h))
-        elastic_forces[i] += 0.5 * (R_i[j] @ f_ij - R_i[i] @ f_ji)
+        elastic_forces[i] += 0.5 * (R_i[j] @ f_ij - R_i[i] @ f_ji) * (1 - ratio[i])
 
 # Compute damping forces
 @ti.func
@@ -171,15 +176,14 @@ def compute_damping_forces():
         damping_forces[i] = -damping * velocity[i]
 
 # Compute pressure forces
-@ti.kernel
-def compute_hole_volume(h: real):
-    for i in range(n_points):
-        v = volume_i[i] * ti.abs(def_grad[i].determinant())
-        pressure_energy[None] += ratio[i] * v * p
-
 @ti.func
 def compute_pressure_forces(h: real):
-    pass
+    compute_A_pg_grad(h)
+    compute_R_grad()
+    compute_nabla_u_grad(h)
+    for i, d in ti.ndrange(n_points, dim):
+        if ratio[i] < 1e-3: continue
+        pressure_forces[i][d] = def_grad[i].determinant() * (def_grad[i].inverse() @ nabla_u_grad[i, d]).trace() * p * ratio[i] * volume_i[i]
 
 @ti.func
 def compute_forces(h: real):
@@ -195,12 +199,12 @@ def compute_forces(h: real):
 def forward(time_step: real, h: real):
     compute_forces(h)
     for i in range(n_points):
-        force = external_forces[i] + elastic_forces[i] + damping_forces[i]
+        force = external_forces[i] + elastic_forces[i] + damping_forces[i] + pressure_forces[i]
         velocity_inter[i] = velocity[i] + time_step * force / mass[i] / 2 * free_points[i]
         position[i] += time_step * velocity_inter[i] * free_points[i]
     compute_forces(h)
     for i in range(n_points):
-        force = external_forces[i] + elastic_forces[i] + damping_forces[i]
+        force = external_forces[i] + elastic_forces[i] + damping_forces[i] + pressure_forces[i]
         velocity[i] = velocity_inter[i] + time_step * force / mass[i] / 2 * free_points[i]
 
 
@@ -302,7 +306,7 @@ def visualize(points):
     export_mp4(render_folder, project_folder + "/render.mp4", 100, "image_", ".png")
 
 def main():
-    set_external_force(ti.Vector([0., 0., -6e-3]))
+    # set_external_force(ti.Vector([0., 0., -6e-3]))
     set_youngs_modulus(5e7)
     set_poisson_ratio(0.4)
     set_mass(1e-3)
@@ -314,7 +318,7 @@ def main():
         set_dirichlet(int(i), ti.Vector([0., 0., 0.]))
     position_list = [position.to_numpy()]
     time_step = 1e-3
-    n_steps = 1000
+    n_steps = 200
     for _ in tqdm(range(n_steps)):
         for _ in range(2):
             forward(time_step / 2, h)
