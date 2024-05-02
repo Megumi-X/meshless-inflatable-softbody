@@ -4,11 +4,12 @@ from options import real, dim
 @ti.func
 def SvdDifferential(F, U, S, V, dF):
     dS = (U.transpose() @ dF @ V)
-    eps = 1e-8
+    eps = 1e-12
     Ut = U.transpose()
     dP = Ut @ dF @ V
     dPt = dP.transpose()
     Sij = ti.Matrix.zero(real, dim, dim)
+    ti.loop_config(serialize=True)
     for i, j in ti.ndrange(3, 3):
         if (i >= j): continue
         if (S[i, i] - S[j, j] > eps):
