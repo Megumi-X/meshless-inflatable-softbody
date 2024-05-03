@@ -70,6 +70,15 @@ nabla_u = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
 A_pq_grad = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points, n_points, dim))
 R_grad = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points, n_points, dim))
 nabla_u_grad = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points, n_points, dim))
+# A_pq_grad = ti.Matrix.field(dim, dim, dtype=real)
+# R_grad = ti.Matrix.field(dim, dim, dtype=real)
+# nabla_u_grad = ti.Matrix.field(dim, dim, dtype=real)
+# block_a = ti.root.pointer(ti.ijk, (n_points, n_points, dim))
+# block_b = ti.root.pointer(ti.ijk, (n_points, n_points, dim))
+# block_c = ti.root.pointer(ti.ijk, (n_points, n_points, dim))
+# block_a.place(A_pq_grad)
+# block_b.place(R_grad)
+# block_c.place(nabla_u_grad)
 sigma = ti.Matrix.field(dim, dim, dtype=real, shape=(n_points,))
 
 # Forces
@@ -81,9 +90,9 @@ pressure_forces = ti.Vector.field(dim, dtype=real, shape=(n_points,))
 # Optimization variables
 x = ti.field(dtype=real, shape=(n_points,), needs_grad=True)
 x_np = -10 * np.ones(n_points)
-for i in range(2, Nx - 2):
-    for j in range(2, Ny - 2):
-        for k in range(2, Nz - 2):
+for i in range(3, Nx - 3):
+    for j in range(3, Ny - 3):
+        for k in range(3, Nz - 3):
             x_np[indices(i, j, k)] = 10
 x.from_numpy(x_np)
 ratio = ti.field(dtype=real, shape=(n_points,))
@@ -100,9 +109,8 @@ compute_ratio()
 # Compute deformation gradient  
 @ti.func
 def compute_v_i(h: real):
-    for i in range(n_points):
-        volume_i[i] = 0
-        rho_i[i] = 0
+    volume_i.fill(0)
+    rho_i.fill(0)
     for i, j in ti.ndrange(n_points, n_points):
         rho_i[i] += mass[j] * W(init_position[i] - init_position[j], h)
     for i in range(n_points):
@@ -113,7 +121,8 @@ def compute_A_pq(h: real):
     A_pq.fill(ti.Matrix.zero(real, dim, dim))
     for i, j in ti.ndrange(n_points, n_points):
         w = W(init_position[i] - init_position[j], h)
-        if w < 1e-8: continue
+        if w == 0:
+            continue
         A_pq[i] += w * mass[j] * (position[j] - position[i]).outer_product(init_position[j] - init_position[i])
 
 @ti.func
@@ -130,11 +139,18 @@ def compute_nabla_u(h: real):
     nabla_u.fill(ti.Matrix.zero(real, dim, dim))
     for i, j in ti.ndrange(n_points, n_points):
         n_w = nabla_W(init_position[i] - init_position[j], h)
-        if n_w.norm() < 1e-8: continue
+        if n_w.norm() == 0:
+            continue
         u_ji_bar = R_i[i].inverse() @ (position[j] - position[i]) - (init_position[j] - init_position[i])
         nabla_u[i] += volume_i[j] * u_ji_bar.outer_product(n_w)
     for i in range(n_points):
         def_grad[i] = ti.Matrix.identity(real, dim) + nabla_u[i].transpose()
+
+@ti.kernel
+def output_nabla_u(h: real):
+    compute_A_pq(h)
+    compute_R_i()
+    compute_nabla_u(h)
 
 # Compute gradient of deformation gradient
 @ti.func
@@ -142,36 +158,51 @@ def compute_A_pg_grad(h: real):
     # ti.deactivate_all_snodes(A_pq_grad)
     A_pq_grad.fill(ti.Matrix.zero(real, dim, dim))
     for i, j, d in ti.ndrange(n_points, n_points, dim):
-        if ratio[i] < 1e-5: continue
+        if ratio[i] < 1e-5:
+            continue
         w = W(init_position[i] - init_position[j], h)
-        if w < 1e-8 or i == j: continue
+        if w == 0 or i == j:
+            continue
         A_pq_grad[i, i, d] += -w * mass[j] * ti.Vector.unit(dim, d, real).outer_product(init_position[j] - init_position[i])
         A_pq_grad[i, j, d] += w * mass[j] * ti.Vector.unit(dim, d, real).outer_product(init_position[j] - init_position[i])
+        # print(A_pq_grad[i, j, d])
 
 @ti.func
 def compute_R_grad():
     for i, j, d in ti.ndrange(n_points, n_points, dim):
-        if ratio[i] < 1e-5 or A_pq_grad[i, j, d].norm() < 1e-8: continue
+    # ti.deactivate_all_snodes(R_grad)
+    # for i, j, d in A_pq_grad:
+        if ratio[i] < 1e-5 or A_pq_grad[i, j, d].norm() == 0:
+            continue
         dU, dS, dV = SvdDifferential(A_pq[i], U_i[i], S_i[i], V_i[i], A_pq_grad[i, j, d])
         R_grad[i, j, d] = dU @ V_i[i].transpose() + U_i[i] @ dV.transpose()
 
 @ti.func
 def compute_nabla_u_grad(h: real):
     nabla_u_grad.fill(ti.Matrix.zero(real, dim, dim))
+    # ti.deactivate_all_snodes(nabla_u_grad)
     for i, j, d in ti.ndrange(n_points, n_points, dim):
-        if ratio[i] < 1e-5 or A_pq_grad[i, j, d].norm() < 1e-8 or i == j: continue
+    # for i, j, d in R_grad:
+        if ratio[i] < 1e-5 or A_pq_grad[i, j, d].norm() == 0 or i == j:
+            continue
         R_inverse = R_i[i].inverse()
         d_R_x_i = -R_inverse @ R_grad[i, i, d] @ R_inverse @ (position[j] - position[i]) - R_inverse @ ti.Vector.unit(dim, d, real)
         d_R_x_j = -R_inverse @ R_grad[i, j, d] @ R_inverse @ (position[j] - position[i]) + R_inverse @ ti.Vector.unit(dim, d, real)
         nabla_u_grad[i, i, d] += volume_i[j] * d_R_x_i.outer_product(nabla_W(init_position[i] - init_position[j], h))
         nabla_u_grad[i, j, d] += volume_i[j] * d_R_x_j.outer_product(nabla_W(init_position[i] - init_position[j], h))
 
+@ti.kernel
+def output_nabla_u_grad(h: real):
+    compute_A_pg_grad(h)
+    compute_R_grad()
+    compute_nabla_u_grad(h)
+
 # Compute elastic forces
 @ti.func
 def compute_stress_strain():
     for i in range(n_points):
-        E = 0.5 * (def_grad[i] @ def_grad[i].transpose() - ti.Matrix.identity(real, dim))
-        sigma[i] = 2 * mu[i] * E + lam[i] * E.trace() * ti.Matrix.identity(real, dim)
+        E = 0.5 * (def_grad[i].transpose() @ def_grad[i] - ti.Matrix.identity(real, dim))
+        sigma[i] = (2 * mu[i] * E + lam[i] * E.trace() * ti.Matrix.identity(real, dim)) * (1 - ratio[i])
 
 @ti.func
 def compute_elastic_forces(h: real):
@@ -179,10 +210,11 @@ def compute_elastic_forces(h: real):
     elastic_forces.fill(ti.Vector.zero(real, dim))
     for i, j in ti.ndrange(n_points, n_points):
         n_w = nabla_W(init_position[i] - init_position[j], h)
-        if n_w.norm() < 1e-8: continue
+        if n_w.norm() == 0:
+            continue
         f_ji = -volume_i[i] * (ti.Matrix.identity(real, dim) + nabla_u[i].transpose()) @ sigma[i] @ (volume_i[j] * n_w)
-        f_ij = -volume_i[j] * (ti.Matrix.identity(real, dim) + nabla_u[j].transpose()) @ sigma[j] @ (volume_i[i] * n_w)
-        elastic_forces[i] += 0.5 * (R_i[j] @ f_ij - R_i[i] @ f_ji) * (1 - ratio[i]) * (1 - ratio[j])
+        f_ij = volume_i[j] * (ti.Matrix.identity(real, dim) + nabla_u[j].transpose()) @ sigma[j] @ (volume_i[i] * n_w)
+        elastic_forces[i] += 0.5 * (R_i[j] @ f_ij - R_i[i] @ f_ji)
 
 # Compute damping forces
 @ti.func
@@ -198,7 +230,8 @@ def compute_pressure_forces(h: real):
     compute_nabla_u_grad(h)
     pressure_forces.fill(ti.Vector.zero(real, dim))
     for i, j, d in ti.ndrange(n_points, n_points, dim):
-        if ratio[i] < 1e-5 or A_pq_grad[i, j, d].norm() < 1e-8 : continue
+        if ratio[i] < 1e-5 or A_pq_grad[i, j, d].norm() == 0 :
+            continue
         pressure_forces[j][d] += def_grad[i].determinant() * (def_grad[i].inverse() @ nabla_u_grad[i, j, d].transpose()).trace() * p * ratio[i] * volume_i[i]
 
 @ti.func
@@ -229,12 +262,12 @@ def forward(time_step: real, h: real):
 #############################################################################################
 @ti.kernel
 def set_external_force(i: integer, f: ti.math.vec3):
-    external_forces[i] = f
+    external_forces[i] = f# * (1 - ratio[i])
 
 @ti.kernel
 def set_external_force(f: ti.math.vec3):
     for i in range(n_points):
-        external_forces[i] = f
+        external_forces[i] = f# * (1 - ratio[i])
 
 @ti.kernel
 def set_dirichlet(i: integer, d: ti.math.vec3):
@@ -285,7 +318,7 @@ def visualize(points):
     render_folder = project_folder + "/render"
     create_folder(render_folder, exist_ok=True)
     vis = o3d.visualization.rendering.OffscreenRenderer(800, 600)
-    vis.setup_camera(60., np.array([0.1, 0, 0.055]), np.array([0.1, 0.5, 0.045]), np.array([0, 0, 1]))
+    vis.setup_camera(60., np.array([0.1, 0, -0.05]), np.array([0.1, 0.4, 0.1]), np.array([0, 0, 1]))
     material = o3d.visualization.rendering.MaterialRecord()
     material.base_color = np.array([0., 0., 0., 1.0])
     material.shader = "defaultLit"
@@ -299,33 +332,58 @@ def visualize(points):
         image_name = render_folder + f"/image_{i:04d}.png"
         image = vis.render_to_image()
         o3d.io.write_image(image_name, image)
-    export_mp4(render_folder, project_folder + "/render.mp4", 100, "image_", ".png")
+    export_mp4(render_folder, project_folder + "/render.mp4", 50, "image_", ".png")
 
 def main():
-    # set_external_force(ti.Vector([0., 0., -6e-3]))
-    set_youngs_modulus(1e7)
+    # set_external_force(ti.Vector([0., 0., -5e-2]))
+    set_youngs_modulus(4e7)
     set_poisson_ratio(0.4)
-    set_mass(1e-4)
-    # print(mass.to_numpy())
-    # print(volume_i.to_numpy())
+    set_mass(5e-3)
+    print(mass)
+    print(rho_i)
     left_most = np.where(points_np[:, 0] <= 0.015)[0]
     right_most = np.where(points_np[:, 0] >= 0.185)[0]
     # print(left_most)
     for i in left_most:
         set_dirichlet(int(i), ti.Vector([0., 0., 0.]))
-    for i in right_most:
-        set_dirichlet(int(i), ti.Vector([0., 0., 0.]))
+    # for i in right_most:
+    #     set_dirichlet(int(i), ti.Vector([0., 0., 0.]))
     position_list = [position.to_numpy()]
-    time_step = 5e-5
-    n_steps = 1000
+    time_step = 5e-3
+    n_steps = 200
     for i in tqdm(range(n_steps)):
-        zoom = 20
+        zoom = 50
         for _ in range(zoom):
             forward(time_step / zoom, h)
         if i % 4 == 0:
             position_list.append(position.to_numpy())
+        # print(pressure_forces[indices(3, 3, 1)])
+        # print(elastic_forces[indices(3, 3, 1)])
+        # print(position[indices(3, 3, 1)])
     visualize(position_list)
     
 
 if __name__ == '__main__':
     main()
+    # set_youngs_modulus(1e7)
+    # set_poisson_ratio(0.4)
+    # set_mass(1e-4)
+    # output_nabla_u(h)
+    # ni = indices(10, 10, 5)
+    # nj = indices(10, 10, 5)
+    # d = 2
+    # nabla_u_np_0 = nabla_u[ni].to_numpy()
+    # output_nabla_u_grad(h)
+    # # print(A_pq_grad)
+    # print("Grad Ana:", nabla_u_grad[ni, nj, d].to_numpy())
+    # @ti.kernel
+    # def updata_position(i: integer, d: integer, delta: real):
+    #     position[i][d] += delta
+    # eps = 1e-9
+    # updata_position(nj, d, eps)
+    # output_nabla_u(h)
+    # nabla_u_np_1 = nabla_u[ni].to_numpy()
+    # updata_position(nj, d, -2 * eps)
+    # output_nabla_u(h)
+    # nabla_u_np_2 = nabla_u[ni].to_numpy()
+    # print("Grad Num:", (nabla_u_np_1 - nabla_u_np_2) / (2 * eps))

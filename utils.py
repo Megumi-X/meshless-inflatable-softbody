@@ -11,7 +11,8 @@ def SvdDifferential(F, U, S, V, dF):
     Sij = ti.Matrix.zero(real, dim, dim)
     ti.loop_config(serialize=True)
     for i, j in ti.ndrange(3, 3):
-        if (i >= j): continue
+        if (i >= j):
+            continue
         if (S[i, i] - S[j, j] > eps):
             Sij[i, j] = 1. / (S[j, j] * S[j, j] - S[i, i] * S[i, i])
             Sij[j, i] = -Sij[i, j]
@@ -38,5 +39,5 @@ def nabla_W(xij: ti.math.vec3, h: real) -> ti.math.vec3:
     if q < 1:
         ret = 1 / (ti.math.pi * h ** 3) * (-3 * xij / h ** 2 + 0.75 * 3 * q * xij / h ** 2)
     elif q >= 1 and q < 2:
-        ret = 1 / (4 * ti.math.pi * h ** 3) * -3 * (2 - q) ** 2 * xij / q / h / h
+        ret = 1 / (4 * ti.math.pi * h ** 3) * -3 * (2 - q) ** 2 * xij / (q * h * h)
     return ret
