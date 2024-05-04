@@ -4,7 +4,7 @@ from options import real, dim
 @ti.func
 def SvdDifferential(F, U, S, V, dF):
     dS = (U.transpose() @ dF @ V)
-    eps = 1e-12
+    eps = 1e-10
     Ut = U.transpose()
     dP = Ut @ dF @ V
     dPt = dP.transpose()

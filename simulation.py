@@ -90,9 +90,9 @@ pressure_forces = ti.Vector.field(dim, dtype=real, shape=(n_points,))
 # Optimization variables
 x = ti.field(dtype=real, shape=(n_points,), needs_grad=True)
 x_np = -10 * np.ones(n_points)
-for i in range(3, Nx - 3):
-    for j in range(3, Ny - 3):
-        for k in range(3, Nz - 3):
+for i in range(2, Nx - 2):
+    for j in range(2, Ny - 2):
+        for k in range(2, Nz - 2):
             x_np[indices(i, j, k)] = 10
 x.from_numpy(x_np)
 ratio = ti.field(dtype=real, shape=(n_points,))
@@ -202,7 +202,10 @@ def output_nabla_u_grad(h: real):
 def compute_stress_strain():
     for i in range(n_points):
         E = 0.5 * (def_grad[i].transpose() @ def_grad[i] - ti.Matrix.identity(real, dim))
-        sigma[i] = (2 * mu[i] * E + lam[i] * E.trace() * ti.Matrix.identity(real, dim)) * (1 - ratio[i])
+        sigma[i] = (2 * mu[i] * E + lam[i] * E.trace() * ti.Matrix.identity(real, dim))# * (1 - ratio[i])
+        # J = def_grad[i].determinant()
+        # F_T_inv = def_grad[i].inverse().transpose()
+        # sigma[i] = (mu[i] * (def_grad[i] - F_T_inv) + lam[i] * (J - 1) * J * F_T_inv) * def_grad[i].transpose() / J * (1 - ratio[i])
 
 @ti.func
 def compute_elastic_forces(h: real):
@@ -336,9 +339,9 @@ def visualize(points):
 
 def main():
     # set_external_force(ti.Vector([0., 0., -5e-2]))
-    set_youngs_modulus(4e7)
+    set_youngs_modulus(1e8)
     set_poisson_ratio(0.4)
-    set_mass(5e-3)
+    set_mass(1e-2)
     print(mass)
     print(rho_i)
     left_most = np.where(points_np[:, 0] <= 0.015)[0]
@@ -350,21 +353,22 @@ def main():
     #     set_dirichlet(int(i), ti.Vector([0., 0., 0.]))
     position_list = [position.to_numpy()]
     time_step = 5e-3
-    n_steps = 200
+    n_steps = 300
     for i in tqdm(range(n_steps)):
         zoom = 50
         for _ in range(zoom):
             forward(time_step / zoom, h)
         if i % 4 == 0:
             position_list.append(position.to_numpy())
-        # print(pressure_forces[indices(3, 3, 1)])
-        # print(elastic_forces[indices(3, 3, 1)])
+        print(pressure_forces[indices(2, 2, 2)])
+        print(pressure_forces[indices(10, 10, 5)])
         # print(position[indices(3, 3, 1)])
     visualize(position_list)
     
 
 if __name__ == '__main__':
     main()
+    # export_mp4(project_folder + "/render", project_folder + "/render.mp4", 50, "image_", ".png")
     # set_youngs_modulus(1e7)
     # set_poisson_ratio(0.4)
     # set_mass(1e-4)
