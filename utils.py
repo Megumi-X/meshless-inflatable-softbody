@@ -41,3 +41,33 @@ def nabla_W(xij: ti.math.vec3, h: real) -> ti.math.vec3:
     elif q >= 1 and q < 2:
         ret = 1 / (4 * ti.math.pi * h ** 3) * -3 * (2 - q) ** 2 * xij / (q * h * h)
     return ret
+
+@ti.func
+def backward_svd(gu, gsigma, gv, u, sig, v):
+    # https://github.com/pytorch/pytorch/blob/ab0a04dc9c8b84d4a03412f1c21a6c4a2cefd36c/tools/autograd/templates/Functions.cpp
+    vt = v.transpose()
+    ut = u.transpose()
+    sigma_term = u @ gsigma @ vt
+
+    s = ti.Vector.zero(real, dim)
+    if ti.static(dim==2):
+        s = ti.Vector([sig[0, 0], sig[1, 1]]) ** 2
+    else:
+        s = ti.Vector([sig[0, 0], sig[1, 1], sig[2, 2]]) ** 2
+    F = ti.Matrix.zero(real, dim, dim)
+    for i, j in ti.static(ti.ndrange(dim, dim)):
+        if i == j: F[i, j] = 0
+        else: F[i, j] = 1./clamp(s[j] - s[i])
+    u_term = u @ ((F * (ut@gu - gu.transpose()@u)) @ sig) @ vt
+    v_term = u @ (sig @ ((F * (vt@gv - gv.transpose()@v)) @ vt))
+    return u_term + v_term + sigma_term
+
+@ti.func
+def clamp(a):
+    # remember that we don't support if return in taichi
+    # stop the gradient ...
+    if a>=0:
+        a = max(a, 1e-6)
+    else:
+        a = min(a, -1e-6)
+    return a
