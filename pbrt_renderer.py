@@ -5,8 +5,7 @@ import numpy as np
 
 from config import to_real_array, to_integer_array
 from log import create_folder, delete_folder, delete_file
-from options import project_folder
-root = project_folder
+root = "./"
 
 class PbrtRenderer:
     def __init__(self):
@@ -215,11 +214,12 @@ class PbrtRenderer:
                     value = list(value)
                     is_float = False
                     for v in value:
-                        if type(v) in [float, float]:
+                        if type(v) in [float, float, np.float64, np.float32]:
                             is_float = True
                             break
                         else:
-                            assert type(v) in [int, int]
+                            # print(type(v))
+                            assert type(v) in [int, int, np.int64, np.int32]
                     if is_float:
                         value = to_real_array(value).ravel()
                     else:
