@@ -12,17 +12,21 @@ import os
 from argparse import ArgumentParser
 from deepsdf import DeepSDFWithCode, device
 from export_video import export_gif
+import scipy
 
 integer = int
 real = wp.float32
 vec = wp.vec3
 mat = wp.mat33
 h = real(0.08)
-damping = real(1e-2)
+damping = real(1e-6)
 pcd_folder = "/mnt/data1/xiongxy/pcd_soft"
 
 parser = ArgumentParser()
 parser.add_argument("--name", "-n", required=True, type=str)
+parser.add_argument("--render", "-r", action="store_true", default=False)
+parser.add_argument("--set_target", "-t", action="store_true", default=False)
+parser.add_argument("--debug", "-d", action="store_true", default=False)
 args = parser.parse_args()
 
 #############################################################################################
@@ -40,7 +44,7 @@ points_np -= delta
 points_torch = torch.from_numpy(points_np).to(device).float()
 points_np += delta
 n_points = points_np.shape[0]
-points_np = points_np @ R + np.array([0., 1.2, 0.])
+points_np = points_np @ R + np.array([0., .7, 0.])
 out_num = pcd_outer_np.shape[0]
 
 sdf = DeepSDFWithCode().to(device)
@@ -51,11 +55,11 @@ except:
 sdf.load_state_dict(torch.load("/mnt/data1/xiongxy/model_soft/" + args.name + "/model_" + str(min_loss_index) +".pth"))
 
 # Simulation parameters
-frames = 6500
-time_step = real(1.2e-4)
+frames = 3000
+time_step = real(5e-5)
 
 # Collision parameters
-collision_penalty_stiffness = real(1e5)
+collision_penalty_stiffness = real(1e4)
 collision_range = real(1e-3)
 
 # Material properties
@@ -75,7 +79,6 @@ position = wp.array(shape=(frames + 1, n_points), dtype=vec, device="cuda", requ
 init_position = wp.from_numpy(points_np, dtype=vec, device="cuda")
 init_position_float = wp.from_numpy(points_np, dtype=wp.vec3, device="cuda")
 velocity = wp.array(shape=(frames + 1, n_points), dtype=vec, device="cuda", requires_grad=True)
-# velocity.fill_(vec([0., -4., 0.]))
 def_grad = wp.array(shape=(frames + 1, n_points), dtype=mat, device="cuda", requires_grad=True)
 
 # Auxiliary fields
@@ -86,20 +89,27 @@ external_forces = wp.array(shape=(n_points), dtype=vec, device="cuda", requires_
 elastic_forces = wp.array(shape=(frames + 1, n_points), dtype=vec, device="cuda", requires_grad=True)
 
 # Optimization variables
+x = wp.array(shape=n_points, dtype=real, device="cuda", requires_grad=True)
+x.fill_(1.)
 x_np = sdf(points_torch).squeeze().detach().cpu().numpy()
 x_np[:out_num] = np.clip(x_np[:out_num], 1., None)
-x = wp.from_numpy(x_np, dtype=real, device="cuda", requires_grad=True)
+x_grad_np = np.zeros(n_points)
+if args.set_target:
+    x = wp.from_numpy(x_np, dtype=real, device="cuda", requires_grad=True)
 ratio = wp.array(shape=n_points, dtype=real, device="cuda", requires_grad=True)
 
 @wp.kernel
 def compute_ratio(x: wp.array(dtype=real), ratio: wp.array(dtype=real)): # type: ignore
     i = wp.tid()
-    ratio[i] = real(0.5) * wp.tanh(real(4.) * x[i]) + real(0.5)
+    ratio[i] = real(0.5) * wp.tanh(real(6.) * x[i]) + real(0.5)
 
 l = wp.array(shape=(1), dtype=real, device="cuda", requires_grad=True)
 
-target_position = wp.array(shape=n_points, dtype=vec, device="cuda")
-target_velocity = wp.array(shape=n_points, dtype=vec, device="cuda")
+target_position = wp.array(shape=(n_points), dtype=vec, device="cuda")
+target_velocity = wp.array(shape=(n_points), dtype=vec, device="cuda")
+if not args.set_target:
+    target_position = wp.from_numpy(np.load(f"./target/{args.name}/position.npy"), dtype=vec, device="cuda")
+    target_velocity = wp.from_numpy(np.load(f"./target/{args.name}/velocity.npy"), dtype=vec, device="cuda")
 
 grid_x = int(2 * (np.max(points_np[:, 0]) - np.min(points_np[:, 0])) / float(h) / 3)
 grid_y = int(2 * (np.max(points_np[:, 1]) - np.min(points_np[:, 1])) / float(h) / 3)
@@ -193,7 +203,7 @@ def compute_nabla_u(grid: wp.uint64, position: wp.array2d(dtype=vec), init_posit
 @wp.func
 def compute_sigma(def_grad: mat, mu: real, lam: real, ratio: real) -> mat: # type: ignore
     E = real(0.5) * (wp.transpose(def_grad) @ def_grad - wp.identity(3, real))
-    s = (real(2.) * mu * E + lam * wp.trace(E) * wp.identity(3, real)) * (0.01 + ratio * 0.99)
+    s = (real(2.) * mu * E + lam * wp.trace(E) * wp.identity(3, real)) * (real(400) - ratio * real(399))
     return s
 
 @wp.kernel
@@ -252,13 +262,16 @@ def startup(position: wp.array2d(dtype=vec), velocity: wp.array2d(dtype=vec), in
     i = wp.tid()
     position[0, i] = init_position[i]
     velocity[0, i] = vec()
+    velocity[0, i][1] = -5.
 
 
 @wp.kernel
 def compute_loss(position: wp.array2d(dtype=vec), velocity: wp.array2d(dtype=vec), target_position: wp.array(dtype=vec), target_velocity: wp.array(dtype=vec), l: wp.array(dtype=real)): # type: ignore
-    i = wp.tid()
-    wp.atomic_add(l, 0, wp.length_sq(position[frames, i] - target_position[i]))
-    wp.atomic_add(l, 0, wp.length_sq(velocity[frames, i] - target_velocity[i]))
+    tid = wp.tid()
+    # f = tid // frames
+    # i = tid % frames
+    wp.atomic_add(l, 0, wp.length_sq(position[frames, tid] - target_position[tid]))
+    wp.atomic_add(l, 0, wp.length_sq(velocity[frames, tid] - target_velocity[tid]) * time_step)
         
 
 #############################################################################################
@@ -305,10 +318,6 @@ def set_mass(m: real): # type: ignore
     mass.fill_(m)
     wp.launch(kernel=compute_v_i, dim=n_points, inputs=[grid.id, init_position, mass, rho, volume, h])
 
-def set_target():
-    wp.copy(target_position, init_position)
-    target_velocity.fill_(vec([0., 0., 0.]))
-
 
 #############################################################################################
 # Simulation and visualization
@@ -317,7 +326,7 @@ def visualize(f, image_name):
     pos_np = position.numpy()
     ratio_np = ratio.numpy()
     r = PbrtRenderer()
-    eye = to_real_array([8, 1, 0])
+    eye = to_real_array([0, 1, 8])
     look_at = to_real_array([0, 0, 0])
     eye = look_at + 1 * (eye - look_at)
     r.set_camera(eye=eye, look_at=look_at, up=[0, 1, 0], fov=40)
@@ -328,11 +337,14 @@ def visualize(f, image_name):
         # print(point)
         r.add_sphere(pos_np[f, i], 0.007, ("diffuse", { "rgb reflectance": (ratio_np[i], 0.0, 1 - ratio_np[i]) }))
     r.add_plane([0., 0., 0.], [0., 1., 0.], 50., ("diffuse", { "rgb reflectance": (0.5, 0.5, 0.5) }))
-    r.set_image(pixel_samples=128, file_name=image_name,
+    r.set_image(pixel_samples=64, file_name=image_name,
         resolution=[1000, 1000])
     r.render(use_gpu="PBRT_OPTIX7_PATH" in os.environ)
 
-def diff_sim():
+def diff_sim(compute_grad=True):
+    wp.launch(kernel=startup, dim=n_points, inputs=[position, velocity, init_position])
+    l.fill_(0.)
+    global x_grad_np
     tape = wp.Tape()
     with tape:
         wp.launch(kernel=compute_ratio, dim=n_points, inputs=[x, ratio])
@@ -347,31 +359,87 @@ def diff_sim():
             wp.launch(kernel=compute_elastic_forces, dim=n_points, inputs=[grid.id, position, init_position, volume, A_pq, def_grad, mu, lam, ratio, elastic_forces, h, f + 1])
             wp.launch(kernel=part_2, dim=n_points, inputs=[position, velocity, mass, external_forces, elastic_forces, free_points, damping, time_step, f])
         wp.launch(kernel=compute_loss, dim=n_points, inputs=[position, velocity, target_position, target_velocity, l])
-    # tape.backward(l)
+    if args.set_target:
+        target_folder = f"./target/{args.name}"
+        create_folder(target_folder, exist_ok=True)
+        np.save(target_folder + "/position.npy", position[frames].numpy())
+        np.save(target_folder + "/velocity.npy", velocity[frames].numpy())
+    elif compute_grad:
+        tape.backward(l)
+        x_grad_np = x.grad.numpy()
+        if args.debug:
+            warp.autograd.gradcheck_tape(tape, eps=1e-5, atol=1e-5, rtol=1e-4)
+
+#############################################################################################
+# Optimization
+#############################################################################################
+def loss(x_opt):
+    global x
+    x = wp.from_numpy(x_opt, dtype=real, device="cuda", requires_grad=True)
+    diff_sim()
+    print("loss: ", l)
+    return l.numpy()
+
+def jac(x_opt):
+    return x_grad_np
+
+def callback(x_opt):
+    np.save(f"./opt/{args.name}/x.npy", x_opt)
+    distance = np.linalg.norm(x_opt - x_np)
+    print("distance: ", distance)
+
+def grad_check(x0, delta, i):
+    x = wp.from_numpy(x0, dtype=real, device="cuda", requires_grad=True)
+    diff_sim()
+    loss = l.numpy()
+    grad = x_grad_np
+    print(grad)
+    x0[i] += delta
+    x = wp.from_numpy(x0, dtype=real, device="cuda", requires_grad=True)
+    diff_sim(False)
+    loss_1 = l.numpy()
+    x0[i] -= 2 * delta
+    x = wp.from_numpy(x0, dtype=real, device="cuda", requires_grad=True)
+    diff_sim(False)
+    loss_2 = l.numpy()
+    grad_num = (loss_1 - loss_2) / (2 * delta)
+    print("grad ana: ", grad[i], "; grad num: ", grad_num)
+
+
 
 def main():
-    set_all_external_force(vec([0., -4e-1, 0.]))
-    wp.launch(kernel=set_youngs_modulus, dim=n_points, inputs=[1e7, youngs_modulus, poisson_ratio, mu, lam])
+    set_all_external_force(vec([0., -1e-4, 0.]))
+    wp.launch(kernel=set_youngs_modulus, dim=n_points, inputs=[1e5, youngs_modulus, poisson_ratio, mu, lam])
     wp.launch(kernel=set_poisson_ratio, dim=n_points, inputs=[0.4, youngs_modulus, poisson_ratio, mu, lam])
-    set_mass(4e-2)
+    set_mass(1e-3)
     # edge = np.where(points_np[:, 2] > 0.85)[0]
     # for i in edge:
     #     set_dirichlet(int(i), vec())
     # pull = np.where(points_np[:, 2] < 0.5)[0]
     # for i in pull:
     #     set_external_force(int(i), vec([0., 0., -1.]))
-    set_target()
-    wp.launch(kernel=startup, dim=n_points, inputs=[position, velocity, init_position])
-    diff_sim()
 
-    print(x.grad.numpy())
-    # warp.autograd.gradcheck_tape(tape)
+    opt_folder = f"./opt/{args.name}"
+    create_folder(opt_folder, exist_ok=True)
+    result = scipy.optimize.minimize(loss, x_np + 1, jac=jac, callback=callback, method="L-BFGS-B", options={"maxiter": 1000, "iprint": 1, "ftol": 1e-8, "gtol": 1e-8})
 
-    render_folder = f"./render/{args.name}"
-    create_folder(render_folder, exist_ok=True)
-    for f in range(0, frames, 50):
-        visualize(f, render_folder + "/sim_{:04d}.png".format(f))
-    export_gif(render_folder, render_folder + "/sim.gif", 25, "sim_", ".png")
+    # lr = 1e-1
+    # x = wp.from_numpy(x_np + 1, dtype=real, device="cuda", requires_grad=True)
+    # for iter in range(100):
+    #     diff_sim()
+    #     print(f"loss {iter}: ", l)
+    #     x = wp.from_numpy(x.numpy() - lr * x_grad_np, dtype=real, device="cuda", requires_grad=True)
+    #     np.save(opt_folder + f"/x_{iter}.npy", x.numpy())
+
+    if args.render:
+        if args.set_target:
+            render_folder = f"./render/{args.name}"
+        else:
+            render_folder = f"./render/{args.name}_opt"
+        create_folder(render_folder, exist_ok=True)
+        for f in range(0, frames, 100):
+            visualize(f, render_folder + "/sim_{:04d}.png".format(f))
+        export_gif(render_folder, render_folder + "/sim.gif", 25, "sim_", ".png")
 
 if __name__ == '__main__':
     main()
