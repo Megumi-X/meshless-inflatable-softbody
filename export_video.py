@@ -27,7 +27,7 @@ def export_mp4(folder_name, mp4_name, fps, name_prefix, name_suffix):
     for i, f in enumerate(frame_names):
         shutil.copyfile(f, tmp_folder / '{:08d}.png'.format(i))
 
-    os.system("ffmpeg -r " + str(fps) + " -i " + str(tmp_folder / "%08d.png") + " -vcodec libx264 -crf 15 -y " + str(mp4_name))
+    os.system("ffmpeg -r " + str(fps) + " -i " + str(tmp_folder / "%08d.png") + " -vcodec libx264 -y " + str(mp4_name))
 
     # Delete temporary folder.
     delete_folder(tmp_folder)

@@ -11,7 +11,7 @@ from config import to_real_array
 import os
 from argparse import ArgumentParser
 from deepsdf import DeepSDFWithCode, device
-from export_video import export_gif
+from export_video import export_mp4
 import scipy
 import json
 import trimesh
@@ -81,18 +81,18 @@ volume = wp.array(shape=n_points, dtype=real, device="cuda")
 free_points = wp.from_numpy(np.ones((n_points, 3)), dtype=vec, device="cuda")
 
 # Particle state
-position = wp.array(shape=(frames + 1, n_points), dtype=vec, device="cuda", requires_grad=True)
+position = [wp.array(shape=(n_points), dtype=vec, device="cuda", requires_grad=True) for _ in range(frames + 1)]
 init_position = wp.from_numpy(points_np, dtype=vec, device="cuda")
 init_position_float = wp.from_numpy(points_np, dtype=wp.vec3, device="cuda")
-velocity = wp.array(shape=(frames + 1, n_points), dtype=vec, device="cuda", requires_grad=True)
-def_grad = wp.array(shape=(frames + 1, n_points), dtype=mat, device="cuda", requires_grad=True)
+velocity = [wp.array(shape=(n_points), dtype=vec, device="cuda", requires_grad=True) for _ in range(frames + 1)]
+def_grad = [wp.array(shape=(n_points), dtype=mat, device="cuda", requires_grad=True) for _ in range(frames + 1)]
 
 # Auxiliary fields
-A_pq = wp.array(shape=(frames + 1, n_points), dtype=mat, device="cuda", requires_grad=True)
+A_pq = [wp.array(shape=(n_points), dtype=mat, device="cuda", requires_grad=True) for _ in range(frames + 1)]
 
 # Forces
 external_forces = wp.array(shape=(n_points), dtype=vec, device="cuda", requires_grad=True)
-elastic_forces = wp.array(shape=(frames + 1, n_points), dtype=vec, device="cuda", requires_grad=True)
+elastic_forces = [wp.array(shape=(n_points), dtype=vec, device="cuda", requires_grad=True) for _ in range(frames + 1)]
 
 # Optimization variables
 x = wp.array(shape=n_points, dtype=real, device="cuda", requires_grad=True)
@@ -111,16 +111,14 @@ def compute_ratio(x: wp.array(dtype=real), ratio: wp.array(dtype=real)): # type:
 
 l = wp.array(shape=(1), dtype=real, device="cuda", requires_grad=True)
 
-target_position = wp.array(shape=(target_frames, n_points), dtype=vec, device="cuda")
-target_velocity = wp.array(shape=(target_frames, n_points), dtype=vec, device="cuda")
+target_position = [wp.array(shape=(n_points), dtype=vec, device="cuda") for _ in range(target_frames)]
+target_velocity = [wp.array(shape=(n_points), dtype=vec, device="cuda") for _ in range(target_frames)]
 if not args.set_target:
-    target_position_np = np.zeros((target_frames, n_points, 3))
-    target_velocity_np = np.zeros((target_frames, n_points, 3))
     for i in range(1, target_frames + 1):
-        target_position_np[i - 1] = np.load(f"./target/{args.name}/position_{i}.npy")
-        target_velocity_np[i - 1] = np.load(f"./target/{args.name}/velocity_{i}.npy")
-    target_position = wp.from_numpy(target_position_np, dtype=vec, device="cuda")
-    target_velocity = wp.from_numpy(target_velocity_np, dtype=vec, device="cuda")
+        target_position_np = np.load(f"./target/{args.name}/position_{i}.npy")
+        target_velocity_np = np.load(f"./target/{args.name}/velocity_{i}.npy")
+        target_position[i - 1] = wp.from_numpy(target_position_np, dtype=vec, device="cuda")
+        target_velocity[i - 1] = wp.from_numpy(target_velocity_np, dtype=vec, device="cuda")
 
 grid_x = int(2 * (np.max(points_np[:, 0]) - np.min(points_np[:, 0])) / float(h) / 3)
 grid_y = int(2 * (np.max(points_np[:, 1]) - np.min(points_np[:, 1])) / float(h) / 3)
@@ -170,10 +168,10 @@ def compute_v_i(grid: wp.uint64, position: wp.array(dtype=vec), mass: wp.array(d
 
 
 @wp.kernel
-def compute_A_pq(grid: wp.uint64, position: wp.array2d(dtype=vec), init_position: wp.array(dtype=vec), mass: wp.array(dtype=real), A_pq: wp.array2d(dtype=mat), h: real, f: integer): # type: ignore
+def compute_A_pq(grid: wp.uint64, position: wp.array(dtype=vec), init_position: wp.array(dtype=vec), mass: wp.array(dtype=real), A_pq: wp.array(dtype=mat), h: real, f: integer): # type: ignore
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
-    x = position[f, i]
+    x = position[i]
     x0 = init_position[i]
     a = mat()
 
@@ -181,8 +179,8 @@ def compute_A_pq(grid: wp.uint64, position: wp.array2d(dtype=vec), init_position
     for j in neighbors:
         if j != i:
             w = W(x0 - init_position[j], h)
-            a += w * mass[j] * wp.outer(position[f, j] - x, init_position[j] - x0)
-    A_pq[f, i] = a
+            a += w * mass[j] * wp.outer(position[j] - x, init_position[j] - x0)
+    A_pq[i] = a
 
 @wp.func
 def compute_R_i(A_pq: mat) -> mat: # type: ignore
@@ -193,22 +191,22 @@ def compute_R_i(A_pq: mat) -> mat: # type: ignore
     return u @ wp.transpose(v)
 
 @wp.kernel
-def compute_nabla_u(grid: wp.uint64, position: wp.array2d(dtype=vec), init_position: wp.array(dtype=vec), volume: wp.array(dtype=real), A_pq: wp.array2d(dtype=mat), def_grad: wp.array2d(dtype=mat), h: real, f: integer): # type: ignore
+def compute_nabla_u(grid: wp.uint64, position: wp.array(dtype=vec), init_position: wp.array(dtype=vec), volume: wp.array(dtype=real), A_pq: wp.array(dtype=mat), def_grad: wp.array(dtype=mat), h: real, f: integer): # type: ignore
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
     x0 = init_position[i]
-    x = position[f, i]
+    x = position[i]
     n_u = mat()
 
-    R_pq_i = compute_R_i(A_pq[f, i])
+    R_pq_i = compute_R_i(A_pq[i])
 
     neighbors = wp.hash_grid_query(grid, wp.vec3(x0), 2. * float(h))
     for j in neighbors:
         if j != i:
             n_w = nabla_W(x0 - init_position[j], h)
-            u_ji_bar = wp.transpose(R_pq_i) @ (position[f, j] - x) - (init_position[j] - x0)
+            u_ji_bar = wp.transpose(R_pq_i) @ (position[j] - x) - (init_position[j] - x0)
             n_u += volume[j] * wp.outer(u_ji_bar, n_w)
-    def_grad[f, i] = wp.identity(3, real) + wp.transpose(n_u)
+    def_grad[i] = wp.identity(3, real) + wp.transpose(n_u)
 
 # Compute elastic forces
 @wp.func
@@ -218,23 +216,23 @@ def compute_sigma(def_grad: mat, mu: real, lam: real, ratio: real) -> mat: # typ
     return s
 
 @wp.kernel
-def compute_elastic_forces(grid: wp.uint64, position: wp.array2d(dtype=vec), init_position: wp.array(dtype=vec), volume: wp.array(dtype=real), A_pq: wp.array2d(dtype=mat), def_grad: wp.array2d(dtype=mat), mu: wp.array(dtype=real), lam: wp.array(dtype=real), ratio: wp.array(dtype=real), elastic_forces: wp.array2d(dtype=vec), h: real, f: integer): # type: ignore
+def compute_elastic_forces(grid: wp.uint64, position: wp.array(dtype=vec), init_position: wp.array(dtype=vec), volume: wp.array(dtype=real), A_pq: wp.array(dtype=mat), def_grad: wp.array(dtype=mat), mu: wp.array(dtype=real), lam: wp.array(dtype=real), ratio: wp.array(dtype=real), elastic_forces: wp.array(dtype=vec), h: real, f: integer): # type: ignore
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
     x0 = init_position[i]
     force = vec()
     neighbors = wp.hash_grid_query(grid, wp.vec3(x0), 2. * float(h))
-    R_pq_i = compute_R_i(A_pq[f, i])
-    s_i = compute_sigma(def_grad[f, i], mu[i], lam[i], ratio[i])
+    R_pq_i = compute_R_i(A_pq[i])
+    s_i = compute_sigma(def_grad[i], mu[i], lam[i], ratio[i])
     for j in neighbors:
         if j != i:
-            s_j = compute_sigma(def_grad[f, j], mu[j], lam[j], ratio[j])
-            R_pq_j = compute_R_i(A_pq[f, j])
+            s_j = compute_sigma(def_grad[j], mu[j], lam[j], ratio[j])
+            R_pq_j = compute_R_i(A_pq[j])
             n_w = nabla_W(init_position[i] - init_position[j], h)
-            f_ji = -volume[i] * def_grad[f, i] @ s_i @ (volume[j] * n_w)
-            f_ij = volume[j] * def_grad[f, i] @ s_j @ (volume[i] * n_w)
+            f_ji = -volume[i] * def_grad[i] @ s_i @ (volume[j] * n_w)
+            f_ij = volume[j] * def_grad[i] @ s_j @ (volume[i] * n_w)
             force += real(0.5) * (R_pq_j @ f_ij - R_pq_i @ f_ji)
-    elastic_forces[f, i] = force
+    elastic_forces[i] = force
 
 # Compute collision penalty
 @wp.func
@@ -247,43 +245,32 @@ def compute_collision_penalty(position: vec) -> vec: # type: ignore
 
 # Simulation Step
 @wp.kernel
-def part_1(position: wp.array2d(dtype=vec), velocity: wp.array2d(dtype=vec), mass: wp.array(dtype=real), external_forces: wp.array(dtype=vec), elastic_forces: wp.array2d(dtype=vec), free_points: wp.array(dtype=vec), damping: real, time_step: real, f: integer): # type: ignore
+def part_1(next_position: wp.array(dtype=vec), next_velocity: wp.array(dtype=vec), position: wp.array(dtype=vec), velocity: wp.array(dtype=vec), mass: wp.array(dtype=real), external_forces: wp.array(dtype=vec), elastic_forces: wp.array(dtype=vec), free_points: wp.array(dtype=vec), damping: real, time_step: real, f: integer): # type: ignore
     i = wp.tid()
-    force = external_forces[i] + elastic_forces[f, i] - damping * velocity[f, i] + compute_collision_penalty(position[f, i])
-    position[f + 1, i] = position[f, i] + wp.cw_mul(time_step * velocity[f, i] + real(.5) * time_step * time_step * force / mass[i], free_points[i])
+    force = external_forces[i] + elastic_forces[i] - damping * velocity[i] + compute_collision_penalty(position[i])
+    next_position[i] = position[i] + wp.cw_mul(time_step * velocity[i] + real(.5) * time_step * time_step * force / mass[i], free_points[i])
 
 @wp.kernel
-def part_2(position: wp.array2d(dtype=vec), velocity: wp.array2d(dtype=vec), mass: wp.array(dtype=real), external_forces: wp.array(dtype=vec), elastic_forces: wp.array2d(dtype=vec), free_points: wp.array(dtype=vec), damping: real, time_step: real, f: integer): # type: ignore
+def part_2(next_position: wp.array(dtype=vec), next_velocity: wp.array(dtype=vec), position: wp.array(dtype=vec), velocity: wp.array(dtype=vec), mass: wp.array(dtype=real), external_forces: wp.array(dtype=vec), elastic_forces: wp.array(dtype=vec), next_elastic_forces: wp.array(dtype=vec), free_points: wp.array(dtype=vec), damping: real, time_step: real, f: integer): # type: ignore
     i = wp.tid()
-    force_1 = external_forces[i] + elastic_forces[f, i] - damping * velocity[f, i] + compute_collision_penalty(position[f, i])
-    force_2 = external_forces[i] + elastic_forces[f + 1, i] - damping * velocity[f, i] + compute_collision_penalty(position[f + 1, i])
-    velocity[f + 1, i] = velocity[f, i] + wp.cw_mul(time_step * (force_1 + force_2) / (real(2.) * mass[i]), free_points[i])
-
-@wp.kernel
-def advance(position: wp.array2d(dtype=vec), velocity: wp.array2d(dtype=vec), mass: wp.array(dtype=real), external_forces: wp.array(dtype=vec), elastic_forces: wp.array2d(dtype=vec), free_points: wp.array(dtype=vec), damping: real, time_step: real, f: integer): # type: ignore
-    i = wp.tid()
-    force = external_forces[i] + elastic_forces[f, i] - damping * velocity[f, i] * mass[i]
-    position[f + 1, i] = position[f, i] + wp.cw_mul(time_step * velocity[f, i], free_points[i])
-    velocity[f + 1, i] = velocity[f, i] + wp.cw_mul(time_step * force / (mass[i]), free_points[i])
-
+    force_1 = external_forces[i] + elastic_forces[i] - damping * velocity[i] + compute_collision_penalty(position[i])
+    force_2 = external_forces[i] + next_elastic_forces[i] - damping * velocity[i] + compute_collision_penalty(next_position[i])
+    next_velocity[i] = velocity[i] + wp.cw_mul(time_step * (force_1 + force_2) / (real(2.) * mass[i]), free_points[i])
 
 
 @wp.kernel
-def startup(position: wp.array2d(dtype=vec), velocity: wp.array2d(dtype=vec), init_position: wp.array(dtype=vec)): # type: ignore
+def startup(position: wp.array(dtype=vec), velocity: wp.array(dtype=vec), init_position: wp.array(dtype=vec)): # type: ignore
     i = wp.tid()
-    position[0, i] = init_position[i]
-    velocity[0, i] = vec()
-    velocity[0, i][1] = -.4
+    position[i] = init_position[i]
+    velocity[i] = vec()
+    velocity[i][1] = real(-.4)
 
 
 @wp.kernel
-def compute_loss(position: wp.array2d(dtype=vec), velocity: wp.array2d(dtype=vec), target_position: wp.array2d(dtype=vec), target_velocity: wp.array2d(dtype=vec), l: wp.array(dtype=real)): # type: ignore
-    tid = wp.tid()
-    f = (tid % target_frames + 1) * (frames // target_frames)
-    ff = tid % target_frames
-    i = tid // target_frames
-    wp.atomic_add(l, 0, wp.length_sq(position[f, i] - target_position[ff, i]))
-    wp.atomic_add(l, 0, wp.length_sq(velocity[f, i] - target_velocity[ff, i]) * time_step)
+def compute_loss(position: wp.array(dtype=vec), velocity: wp.array(dtype=vec), target_position: wp.array(dtype=vec), target_velocity: wp.array(dtype=vec), l: wp.array(dtype=real)): # type: ignore
+    i = wp.tid()
+    wp.atomic_add(l, 0, wp.length_sq(position[i] - target_position[i]))
+    wp.atomic_add(l, 0, wp.length_sq(velocity[i] - target_velocity[i]) * time_step)
         
 
 #############################################################################################
@@ -322,11 +309,12 @@ def set_mass(m: real): # type: ignore
 
 def clear_grads():
     x.grad.fill_(0.)
-    position.grad.fill_(vec(0., 0., 0.))
-    velocity.grad.fill_(vec(0., 0., 0.))
-    def_grad.grad.fill_(mat())
-    A_pq.grad.fill_(mat())
-    elastic_forces.grad.fill_(vec(0., 0., 0.))
+    for f in range(frames + 1):
+        position[f].grad.fill_(vec(0., 0., 0.))
+        velocity[f].grad.fill_(vec(0., 0., 0.))
+        def_grad[f].grad.fill_(mat())
+        A_pq[f].grad.fill_(mat())
+        elastic_forces[f].grad.fill_(vec(0., 0., 0.))
     external_forces.grad.fill_(vec(0., 0., 0.))
     ratio.grad.fill_(0.)
 
@@ -351,25 +339,27 @@ def visualize(f, image_name):
     r.render(use_gpu="PBRT_OPTIX7_PATH" in os.environ)
 
 def diff_sim(compute_grad=True):
-    wp.launch(kernel=startup, dim=n_points, inputs=[position, velocity, init_position])
+    wp.launch(kernel=startup, dim=n_points, inputs=[position[0], velocity[0], init_position])
     l.fill_(0.)
-    l.grad.fill_(1.)
     clear_grads()
     global x_grad_np
     tape = wp.Tape()
     with tape:
         wp.launch(kernel=compute_ratio, dim=n_points, inputs=[x, ratio])
-        wp.launch(kernel=compute_A_pq, dim=n_points, inputs=[grid.id, position, init_position, mass, A_pq, h, 0])
-        wp.launch(kernel=compute_nabla_u, dim=n_points, inputs=[grid.id, position, init_position, volume, A_pq, def_grad, h, 0])
-        wp.launch(kernel=compute_elastic_forces, dim=n_points, inputs=[grid.id, position, init_position, volume, A_pq, def_grad, mu, lam, ratio, elastic_forces, h, 0])
+        wp.launch(kernel=compute_A_pq, dim=n_points, inputs=[grid.id, position[0], init_position, mass, A_pq[0], h, 0])
+        wp.launch(kernel=compute_nabla_u, dim=n_points, inputs=[grid.id, position[0], init_position, volume, A_pq[0], def_grad[0], h, 0])
+        wp.launch(kernel=compute_elastic_forces, dim=n_points, inputs=[grid.id, position[0], init_position, volume, A_pq[0], def_grad[0], mu, lam, ratio, elastic_forces[0], h, 0])
         for f in tqdm(range(frames)):
-            wp.launch(kernel=part_1, dim=n_points, inputs=[position, velocity, mass, external_forces, elastic_forces, free_points, damping, time_step, f])
+            wp.launch(kernel=part_1, dim=n_points, inputs=[position[f + 1], velocity[f + 1], position[f], velocity[f], mass, external_forces, elastic_forces[f], free_points, damping, time_step, f])
             # wp.launch(kernel=advance, dim=n_points, inputs=[position, velocity, mass, external_forces, elastic_forces, free_points, damping, time_step, f])
-            wp.launch(kernel=compute_A_pq, dim=n_points, inputs=[grid.id, position, init_position, mass, A_pq, h, f + 1])
-            wp.launch(kernel=compute_nabla_u, dim=n_points, inputs=[grid.id, position, init_position, volume, A_pq, def_grad, h, f + 1])
-            wp.launch(kernel=compute_elastic_forces, dim=n_points, inputs=[grid.id, position, init_position, volume, A_pq, def_grad, mu, lam, ratio, elastic_forces, h, f + 1])
-            wp.launch(kernel=part_2, dim=n_points, inputs=[position, velocity, mass, external_forces, elastic_forces, free_points, damping, time_step, f])
-        wp.launch(kernel=compute_loss, dim=(target_frames) * n_points, inputs=[position, velocity, target_position, target_velocity, l])
+            wp.launch(kernel=compute_A_pq, dim=n_points, inputs=[grid.id, position[f + 1], init_position, mass, A_pq[f + 1], h, f + 1])
+            wp.launch(kernel=compute_nabla_u, dim=n_points, inputs=[grid.id, position[f + 1], init_position, volume, A_pq[f + 1], def_grad[f + 1], h, f + 1])
+            wp.launch(kernel=compute_elastic_forces, dim=n_points, inputs=[grid.id, position[f + 1], init_position, volume, A_pq[f + 1], def_grad[f + 1], mu, lam, ratio, elastic_forces[f + 1], h, f + 1])
+            wp.launch(kernel=part_2, dim=n_points, inputs=[position[f + 1], velocity[f + 1], position[f], velocity[f], mass, external_forces, elastic_forces[f], elastic_forces[f + 1], free_points, damping, time_step, f])
+        for i in range(target_frames):
+            f = frames // target_frames * (i + 1)
+            wp.launch(kernel=compute_loss, dim=n_points, inputs=[position[f], velocity[f], target_position[i], target_velocity[i], l])
+    # tape.zero()
     if args.set_target:
         target_folder = f"./target/{args.name}"
         create_folder(target_folder, exist_ok=True)
@@ -392,6 +382,17 @@ def loss(x_opt):
     diff_sim()
     print("loss: ", l)
     last_loss = l.numpy().item()
+    if args.render:
+        if args.set_target:
+            render_folder = f"./render/{args.name}"
+        elif args.init:
+            render_folder = f"./render/{args.name}_init"
+        else:
+            render_folder = f"./render/{args.name}_opt"
+        create_folder(render_folder, exist_ok=True)
+        for f in range(0, frames, 50):
+            visualize(f, render_folder + "/sim_{:04d}.png".format(f))
+        export_mp4(render_folder, render_folder + "/sim.mp4", 25, "sim_", ".png")
     return last_loss
 
 def jac(x_opt):
@@ -443,14 +444,14 @@ def main():
     set_mass(1e-4)
 
     if args.debug:
-        grad_check(x_np + 1, [1e-3, 1e-4, 1e-5, 1e-6])
+        grad_check(np.zeros(n_points), [1e-3, 1e-7, 1e-6, 1e-5, 1e-4], 5000)
 
     if args.set_target or args.init:
         diff_sim(False)
     else:
         opt_folder = f"./opt/{args.name}"
         create_folder(opt_folder, exist_ok=True)
-        result = scipy.optimize.minimize(loss, x_np - 1, jac=jac, callback=callback, method="L-BFGS-B", options={"maxiter": 1000, "iprint": 1, "ftol": 1e-8, "gtol": 1e-8})
+        result = scipy.optimize.minimize(loss, np.load("opt/pear/x.npy") + np.random.random(n_points) * 1e-2, jac=jac, callback=callback, method="L-BFGS-B", options={"maxiter": 1000, "iprint": 1, "ftol": 1e-10, "gtol": 1e-10, "disp": True, "norm": np.inf})
         np.save(opt_folder + "/x.npy", result.x)
         plt.plot(distances)
         plt.savefig(opt_folder + "/distance.png")
@@ -469,7 +470,7 @@ def main():
         create_folder(render_folder, exist_ok=True)
         for f in range(0, frames, 50):
             visualize(f, render_folder + "/sim_{:04d}.png".format(f))
-        export_gif(render_folder, render_folder + "/sim.gif", 25, "sim_", ".png")
+        export_mp4(render_folder, render_folder + "/sim.mp4", 25, "sim_", ".png")
 
 if __name__ == '__main__':
     main()
